@@ -1,0 +1,1316 @@
+---
+title: "group_project_draft_2"
+author: "Daryl Suen"
+date: "2023-12-04"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+Some are not required but were added when trying to get some
+experimental code to work.
+
+```{r}
+library(tidyverse)
+library(sf)
+library(plotly)
+library(caret)
+library(likert)
+library(grid)
+library(gridExtra)
+library(ggpubr)
+library(dplyr)
+library(ggcorrplot)
+library(moments)
+library(GGally)
+library(hexbin)
+library(ggplot2)
+library(sparkline)
+library(shiny)
+library(rpart)
+library(visTree)
+library(visNetwork)
+library(shinyWidgets)
+library(colourpicker)
+library(rpart.plot)
+```
+
+## Load data
+
+```{r}
+setwd("C:/Users/daryl/OneDrive/Desktop/gdaa-1001/GroupProject")
+
+csv_1 <- read.csv('csv_1_project.csv', na.strings = c('', 'NA'))
+csv_2 <- read.csv('csv_2_project.csv', na.strings = c('', 'NA'))
+csv_3 <- read.csv('csv_3_project.csv', na.strings = c('', 'NA'))
+da_csv <- read.csv('bc_da_bcalbers_unlocked.csv', na.strings = c('', 'NA'))
+da_shape <- st_read('lda_000b21a_e.shp')
+```
+
+## Data Cleaning
+
+There are three .csv files with data that will be joined into one. We
+can do a multi-table join by creating a list of the data tables and
+using the reduce() combined with inner_join(). In order to do so the
+'DAUID' column in the da_shape table must be renamed to COL0 so the the
+joining columns all have the same name. Blank values and invalid zero
+values will be removed from the data. We will also rename the columns in
+csv_2 and csv_3 so that they are easier to identify in the merged table.
+Finally, we will create proportional variables and remove the variables
+that they were derived from.
+
+```{r}
+csv_2_named <- csv_2 %>% 
+  mutate(csv_2_COL2 = COL2,
+         csv_2_COL3 = COL3,
+         csv_2_COL4 = COL4,
+         csv_2_COL7 = COL7,
+         csv_2_COL8 = COL8,
+         csv_2_COL9 = COL9) %>% 
+  subset(select = -c(COL2,
+                     COL3,
+                     COL4,
+                     COL7,
+                     COL8,
+                     COL9)
+         )
+
+csv_3_named <- csv_3 %>% 
+  mutate(csv_3_COL2 = COL2,
+         csv_3_COL3 = COL3,
+         csv_3_COL4 = COL4) %>% 
+  subset(select = -c(COL2,
+                     COL3,
+                     COL4)
+         )
+
+da_csv_1 <- da_csv %>% 
+  mutate(COL0 = DAUID)
+
+list_csv =list(csv_1, csv_2_named, csv_3_named, da_csv_1)
+
+table <- list_csv %>% 
+  reduce(inner_join, by='COL0')  
+```
+
+There are a bunch of blank cells that were turned into 'NA' in excel.
+Get rid of those using the na.omit() function.
+
+```{r}
+table_no_na <- na.omit(table)
+```
+
+Remove rows that have invalid values and remove the first row where COL0
+= 5915 since that is a sum of values for each column in the table and
+not an observation of the variable.
+
+Median income must have a positive value because a median of zero
+implies that half the households in the DA earn a negative income, which
+is highly unlikely. It would be a valid zero if the DA had a population
+of zero but we want to get rid of those, if any, anyway. Columns for
+totals can't have zeroes:
+
+csv_1[COL8-total couples],
+
+csv_1[COL10],
+
+csv_1[COL13],
+
+csv_1[COL27-total ownership status],
+
+csv_1[COL48-total labour participation],
+
+csv_2[COL2-total households spending 30%],
+
+csv_3[COL2-total immigration population].
+
+```{r}
+table_no_zeroes <- table_no_na %>% 
+  filter(COL0!=5915,  
+         COL20!=0, #csv_1[COL20-median income]
+         COL27!=0, #csv_1[COL27-total ownership status]
+         COL48!=0, #csv_1[COL48-total labour participation]
+         csv_2_COL2!=0, #csv_2[COL2-total households spending 30%]
+         csv_3_COL2!=0) #csv_3[COL2-total immigration population]
+```
+
+Get rid of some extraneous columns from the join operations and zeroes
+removal.
+
+```{r}
+table_reduced <- table_no_zeroes %>% 
+  subset(select = -c(COL0, 
+                     COL27, 
+                     COL48, 
+                     csv_2_COL2, 
+                     csv_3_COL2, 
+                     DGUID,
+                     DAUID,
+                     PRUID)
+         )
+```
+
+Name the columns.
+
+```{r}
+names(table_reduced) <- c(
+  'pop', #COL6
+  'mar_child', #COL10
+  'com_child', #COL13
+  'fem_par', #COL16
+  'mal_par', #COL17
+  'median_income', #COL20
+  'owners', #COL28
+  'renters', #COL29
+  'unemp', #COL50
+  'lt_30', #csv_2_COL3
+  'gt_30', #csv_2_COL4
+  'no_edu', #csv_2_COL7
+  'hs_edu', #csv_2_COL8
+  'ps_edu', #csv_2_COL9
+  'non_immig', #csv_3_COL3
+  'immig', #csv_3_COL4
+  'area_km2'
+  )
+
+table_named <- table_reduced
+```
+
+Create proportional variables for one-parent families, ownership status,
+household spending \>30% of income on shelter, immigration population,
+and create a population density variable.
+
+```{r}
+table_prop <- table_named %>% 
+  mutate(sin_par_prop = ((fem_par + mal_par) / (fem_par + mal_par + mar_child + com_child))*100,
+         renter_prop = (renters / (renters + owners))*100,
+         gt_30_prop = (gt_30 / (gt_30 + lt_30))*100,
+         no_edu_prop = (no_edu / (no_edu + hs_edu + ps_edu))*100,
+         immig_prop = (immig / (immig + non_immig))*100,
+         pop_dens_km2 = pop/area_km2
+         )
+```
+
+Remove variables from the proportion calculations that won't be used
+anymore.
+
+```{r}
+table_prop_reduced <- table_prop %>% 
+  subset(select = -c(fem_par, 
+                     mal_par,
+                     mar_child,
+                     com_child,
+                     renters,
+                     owners,
+                     lt_30,
+                     gt_30,
+                     no_edu,
+                     hs_edu,
+                     ps_edu,
+                     immig,
+                     non_immig,
+                     pop,
+                     area_km2)
+         )
+```
+Create a shapefile of the dataset to work with in Pro. Maybe we can map the target variable High/Low categories and do something with it. It would be interesting if we could map the predictions from the models including the wrong predictions.
+
+Add the three backticks at the beginning and end if you want this chunk to run. It saves a shapefile to your computer as long as your working directory is set.
+
+{r}
+# Need to convert 'DAUID' in da_csv from character to integer type.
+table_prop_reduced_DAUID_as_char <- table_prop_reduced %>% 
+  mutate(DAUID_char = as.character(table_prop_reduced$DAUID))
+
+project_shape <- inner_join(da_shape, 
+                            table_prop_reduced_DAUID_as_char,
+                            by=c('DAUID'='DAUID_char')
+                            )
+
+subset(table_prop_reduced, select = -c(DAUID))
+
+st_write(project_shape, 'project_shape.shp')
+
+
+
+Create a categorized, factored target variable from 'gt_30_prop' that
+will be our dependent variable in our models. There will be two
+categories, 'High' and 'Low'. DA's in the 'High' category have more than
+38.28% of households experiencing unaffordable housing, and DA's in the
+'Low' category have less than or equal to 38.28% of households
+experiencing unaffordable housing, where 38.28% is one standard
+deviation above the mean. (Low is not the best name since there are
+values in the category that are above the mean but it will just be our
+naming convention. We're interested in the 'High' category). To create
+this table we first create a separate table for the 'High' observations
+and another for the 'Low' observations. These will be very imbalanced in
+their numbers of observations so the table will have to be re-balanced
+so that they contain equal numbers of observations. Then, the tables
+will be re-joined into the final dataset for the modelling.
+
+```{r}
+#Categorize the target variable into 'High' and 'Low" values.
+gt_30_sd <- sd(table_prop_reduced$gt_30_prop)
+
+mean_30 <- mean(table_prop_reduced$gt_30_prop)
+
+print(paste0("Mean of 'gt_30_prop': ", mean_30, "%"))
+
+table_hl <- table_prop_reduced %>% 
+  mutate(target_hl = case_when(
+    gt_30_prop > mean_30 + gt_30_sd ~ 'High',
+    gt_30_prop <= mean_30 + gt_30_sd ~ 'Low')
+    ) %>% 
+  subset(select = -c(gt_30_prop))
+```
+
+Factor 'target_hl'.
+
+```{r}
+table_hl$target_hl <- as.factor(table_hl$target_hl)
+class(table_hl$target_hl)
+```
+
+How many 'High' and 'Low' values are there?
+
+```{r}
+tapply(table_hl$target_hl, table_hl$target_hl, length)
+```
+
+Visual of factor balance.
+
+```{r}
+table_hl %>% 
+  ggplot(aes(x=target_hl, fill=target_hl)) +
+  geom_bar()
+```
+
+Create tables for 'High' and 'Low' observations.
+
+```{r}
+df_high <- table_hl %>% 
+  filter(target_hl == 'High') %>% 
+  sample_n(500)
+
+df_low <- table_hl %>% 
+  filter(target_hl == 'Low') %>% 
+  sample_n(500)
+
+# Join the tables by adding the rows together. Note to self: You can do this because the columns are exactly the same. If there were any columns not shared then thos columns would get NA values.
+table_hl_2 <- bind_rows(df_high, df_low, .id = NULL)
+```
+
+```{r}
+table_hl_2 %>% 
+  ggplot(aes(x=target_hl, fill=target_hl)) +
+  geom_bar()
+```
+
+## Exploratory Data Analysis
+
+We will inspect the variables for any issues that would affect the
+modelling. We already expect that there may be multicollinearity because
+the variables from statistical surveys have a common purpose, in this
+case, to indicate the economic health of households. However, as far as
+I know this can't be tested for until after a predictive algorithm is
+applied (VIF test). We can look for correlations between predictor
+variables which would create redundancy in our dataset.
+
+Afterwards, we will inspect the distribution of values for all the
+variables looking for deviations from normality and problematic
+outliers. Why afterwards? Because inspecting and transforming a variable
+is time consuming so if there are variables that can't be used we would
+want to know before this step. Transforming data may improve model
+performance but it actually could impair performance, too. We will keep
+this in mind when trying to normalize distributions or trim outliers. We
+will create a second dataset that remains untransformed, use both and
+compare the results to see what difference transformed data makes.
+
+## Take a look for correlations among variables.
+
+Before factoring the variable, scaling and transformations.
+
+```{r}
+cor_lines <- function(data, mapping, ...){
+  p <- ggplot(data = data, mapping = mapping) +
+    geom_point(alpha = 0.2, size = 0.2) +
+    geom_smooth(method = lm, fill = 'blue', colr = 'blue', ...)
+  p
+}
+
+g = ggpairs(table_prop_reduced, lower = list(continuous = cor_lines),
+            upper = list(continuous = wrap('cor', alpha = 1, size = 10))) +
+  theme_gray(base_size = 18) +
+  theme(axis.text = element_blank())
+        
+       
+g
+```
+
+After factoring the target variable into 'High' and 'Low'.
+
+```{r}
+
+table_hl_2 %>% 
+  ggpairs(aes(color=target_hl, alpha=0.20, ),
+          upper = list(continuous = wrap('cor', # Font size for correlation values.
+                                         alpha=1, 
+                                         size=6)
+                       ),
+          lower = list(continuous = wrap('points', # Size of points. 
+                                         alpha=0.5, 
+                                         size=0.2)
+                       )
+          ) +
+  theme_gray(base_size = 18) + # Font size for row and column headers.
+  theme(axis.line = element_blank(), 
+        axis.text = element_blank(),
+        axis.ticks = element_blank()
+        )
+```
+
+## Variable Distributions
+
+Three tests are performed to inspect the distribution of values for a
+variable:
+
+1.  Shapiro-Wilk test. The null hypothesis is 'the population is
+    reasonably assumed to follow a normal distribution'. p-values below
+    our chosen level of significance, 0.05, reject the null hypothesis.
+    The W-value takes values between 0 and 1 with 1 being a normal
+    distribution. Since the Shapiro-Wilk test becomes very sensitive to
+    deviations from a normal distribution when n \> 50 we will use a 30%
+    sample from our data. The sample size will still be much larger than
+    n = 50 but produce p-values more likely to not reject the null
+    hypothesis. We will mainly be looking at the W-value to determine
+    normality.
+
+2.  The 'skewness() function. Values between -.05 and +0.5 means that
+    the distribution is fairly symmetrical about the mean. Values
+    between -1.0 and -0.5, and +0.5 and +1.0 represent moderate
+    asymmetry. Values less than -1.0 or greater than +1.0 represent
+    heavy asymmetry.
+
+3.  The 'kurtosis()'. A value of 3.0 is similar to a normal
+    distribution. A value greater than 3.0 is leptokurtic meaning that
+    values are more concentrated about the mean and generally have
+    heavier tails or extreme outliers. A value less than 3.0 is
+    platykurtic meaning that values are more spread out from the mean,
+    generally have lighter tails with fewer outliers.
+
+## Distribution of the population density variable
+
+Note: The stats values will change everytime you run the code due to the
+'sample_n()' taking a new sample each run but they should be close to
+the values I had been including in the text. I stopped including the
+values in the text once I realized this was happening.
+
+The population density variable is heavily skewed to the right with
+extreme outliers (skewness = 3.09). Median value is 4,950.35 yet the max
+is 76,474.36! Distribution is strongly leptokurtic (kurtosis = 13.80).
+Shapiro-Wilk fails (W = 0.63, p-value = 2.2e-16). A log transformation
+will be performed and the tails will be trimmed to remove problematic
+outliers.
+
+Warning: I tickered with these chunks a lot. The code runs but should be
+checked over to make sure the right data tables are in the right spots.
+
+```{r}
+summary(table_hl_2$pop_dens_km2)
+
+sw_test <- table_hl_2 %>% 
+  sample_n(300)
+
+result_pop <- shapiro.test(sw_test$pop_dens_km2)
+print(result_pop)
+
+skewness_pop <- skewness(sw_test$pop_dens_km2)
+print(paste0('Skewness: ', skewness_pop))
+
+kurtosis_pop <- kurtosis(sw_test$pop_dens_km2)
+print(paste0('Kurtosis: ', kurtosis_pop))
+
+# Visualizing the full dataset, not the sample 'sw_test'.
+stats_pop <- sw_test %>% 
+  summarize(mean_pop=mean(pop_dens_km2))
+
+table_hl_2 %>% 
+  ggplot(aes(pop_dens_km2)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_pop), 
+             stats_pop, 
+             color='red', 
+             linewidth=1) -> pop1
+ggplotly(pop1)
+```
+
+Log transformation on population density variable. The log
+transformation actually takes care of the extreme right outliers but now
+the distribution is skewed to the left so the tails will still be
+trimmed a bit. But, it is now much closer to a normal distribution.
+
+```{r}
+table_poplog <- table_hl_2 %>% 
+  mutate(poplog = log(pop_dens_km2)) %>% 
+  subset(select = -c(pop_dens_km2))
+
+summary(table_poplog$poplog)
+
+sw_poplog <- table_poplog %>% 
+  sample_n(300)
+
+result_poplog <- shapiro.test(sw_poplog$poplog)
+print(result_poplog)
+
+skewness_poplog <- skewness(sw_poplog$poplog)
+print(paste0('Skewness: ', skewness_poplog))
+
+kurtosis_poplog <- kurtosis(sw_poplog$poplog)
+print(paste0('Kurtosis: ', kurtosis_poplog))
+
+stats_poplog <- table_poplog %>% 
+  summarize(mean_poplog=mean(poplog))
+
+table_poplog %>% 
+  ggplot(aes(poplog)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_poplog), 
+             stats_poplog, 
+             color='red', 
+             linewidth=1) -> pop2
+ggplotly(pop2)
+```
+
+Tail trimming of the population density variable. The distribution is
+fairly symmetrical, a bit playkurtic and closer to normal (skewness =
+0.07, kurtosis = 2.46, W-value = 0.99, p-value = 0.03).
+
+```{r}
+quartiles <- quantile(table_poplog$poplog, 
+                      probs = c(0.25, 0.75), 
+                      na.rm = FALSE)
+IQR_poplog <- IQR(table_poplog$poplog)
+
+Lower <- quartiles[1] - 0.93*IQR_poplog
+Upper <- quartiles[2] + 0.93*IQR_poplog
+
+table_pop_iqr <- table_poplog %>% 
+  filter(poplog > Lower & poplog < Upper)
+
+summary(table_pop_iqr$poplog)
+
+sw_pop_iqr <- table_pop_iqr %>% 
+  sample_n(272)
+
+result_poplog_iqr <- shapiro.test(sw_pop_iqr$poplog)
+print(result_poplog_iqr)
+
+skewness_poplog_iqr <- skewness(sw_pop_iqr$poplog)
+print(paste0('Skewness: ', skewness_poplog_iqr))
+
+kurtosis_poplog_iqr <- kurtosis(sw_pop_iqr$poplog)
+print(paste0('Kurtosis: ', kurtosis_poplog_iqr))
+
+stats_pop_iqr <- table_pop_iqr %>% 
+  summarize(mean_poplog_iqr=mean(poplog))
+
+table_pop_iqr %>% 
+  ggplot(aes(poplog)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_poplog_iqr), 
+             stats_pop_iqr, 
+             color='red', 
+             linewidth=1) -> pop3
+ggplotly(pop3)
+```
+
+Distribution of the median income variable is close to normal (skewness
+= 0.39, kurtosis = 3.24, W = 0.99, p-value = 0.008). We will leave it as
+is.
+
+```{r}
+table_income <- table_pop_iqr
+
+summary(table_income$median_income)
+
+sw_income <- table_income %>% 
+  sample_n(272)
+
+result_median_income <- shapiro.test(sw_income$median_income)
+print(result_median_income)
+
+skewness_mi <- skewness(sw_income$median_income)
+print(paste0('Skewness: ', skewness_mi))
+
+kurtosis_mi <- kurtosis(sw_income$median_income)
+print(paste0('Kurtosis: ', kurtosis_mi))
+
+median_income_stats <- table_income %>% 
+  summarize(mean_mi=mean(median_income))
+
+table_income %>% 
+  ggplot(aes(median_income)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_mi), 
+                 median_income_stats,
+                 color='red',
+                 linewidth=1) -> mi1
+ggplotly(mi1)
+```
+
+Distribution of the unemployment variable. The distribution is
+moderately skewed to the right, leptokurtic and has a group of zero
+value outliers.
+
+```{r}
+table_unemp <- table_income
+
+summary(table_unemp$unemp)
+
+result_unemp <- shapiro.test(sw_income$unemp)
+print(result_unemp)
+
+skewness_unemp <- skewness(sw_income$unemp)
+print(paste0('Skewness: ', skewness_unemp))
+
+kurtosis_unemp <- kurtosis(sw_income$unemp)
+print(paste0('Kurtosis: ', kurtosis_unemp))
+
+unemp_stats <- table_unemp %>% 
+  summarize(mean_unemp=mean(unemp))
+
+table_unemp %>% 
+  ggplot(aes(unemp)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_unemp), 
+                 unemp_stats,
+                 color='red',
+                 linewidth=1) -> unemp1
+ggplotly(unemp1)
+```
+
+Trim the zero value outliers. The distribution is closer to normal now
+(skewness = 0.45, kurtosis = 2.64, W = 0.98, p-value = 4.0e-4). We'll
+leave it as is.
+
+```{r}
+quartiles_unemp <- quantile(table_unemp$unemp, 
+                      probs = c(0.25, 0.75), 
+                      na.rm = FALSE)
+IQR_unemp <- IQR(table_unemp$unemp)
+
+Lower_unemp <- quartiles_unemp[1] - 1.1*IQR_unemp
+Upper_unemp <- quartiles_unemp[2] + 1.1*IQR_unemp
+
+table_unemp_iqr <- table_unemp%>% 
+  filter(unemp > Lower_unemp & unemp < Upper_unemp)
+
+summary(table_unemp_iqr$unemp)
+
+sw_unemp_iqr <- table_unemp_iqr %>% 
+  sample_n(249)
+
+result_unemp <- shapiro.test(sw_unemp_iqr$unemp)
+print(result_unemp)
+
+skewness_unemp <- skewness(sw_unemp_iqr$unemp)
+print(paste0('Skewness: ', skewness_unemp))
+
+kurtosis_unemp <- kurtosis(sw_unemp_iqr$unemp)
+print(paste0('Kurtosis: ', kurtosis_unemp))
+
+unemp_stats_iqr <- table_unemp_iqr %>% 
+  summarize(mean_unemp=mean(unemp))
+
+table_unemp_iqr %>% 
+  ggplot(aes(unemp)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_unemp), 
+                 unemp_stats_iqr,
+                 color='red',
+                 linewidth=1) -> unemp2
+ggplotly(unemp2)
+```
+
+Distribution of the single parent variable. Moderately skewed to the
+right, a bit leptokurtic, not too bad but fails the Shapiro_Wilk test
+(skewness = 0.63, kurtosis = 4.00, W = 0.97, p-value = 1.3e-4). The
+issue is probably the outliers to the right so we will trim the tails.
+
+```{r}
+table_sin_par <- table_unemp_iqr
+
+summary(table_sin_par$sin_par_prop)
+
+# We can use sw_unemp_iqr again.
+result_sin_par <- shapiro.test(sw_unemp_iqr$sin_par_prop)
+print(result_sin_par)
+
+skewness_sin_par <- skewness(sw_unemp_iqr$sin_par_prop)
+print(paste0('Skewness: ', skewness_sin_par))
+
+kurtosis_sin_par <- kurtosis(sw_unemp_iqr$sin_par_prop)
+print(paste0('Kurtosis: ', kurtosis_sin_par))
+
+sin_par_stats <- table_sin_par %>% 
+  summarize(mean_sin_par=mean(sin_par_prop))
+
+table_sin_par %>% 
+  ggplot(aes(sin_par_prop)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_sin_par), 
+                 sin_par_stats,
+                 color='red',
+                 linewidth=1) -> sin_par1
+ggplotly(sin_par1)
+```
+
+Trimming the tails of the single-parent variable. After trimming the
+distribution seems a bit closer to normal and doesn't have extreme
+outliers to the right anymore (skewness = 0.42, kurtosis = 2.81, p-value
+= 1.4e-3).
+
+```{r}
+quartiles_sin_par <- quantile(table_sin_par$sin_par_prop, 
+                      probs = c(0.25, 0.75), 
+                      na.rm = FALSE)
+IQR_sin_par <- IQR(table_sin_par$sin_par_prop)
+
+Lower_sin_par <- quartiles_sin_par[1] - 1.52*IQR_sin_par
+Upper_sin_par <- quartiles_sin_par[2] + 1.52*IQR_sin_par
+
+table_sin_par_iqr <- table_sin_par%>% 
+  filter(sin_par_prop > Lower_sin_par & sin_par_prop < Upper_sin_par)
+
+summary(table_sin_par_iqr$sin_par_prop)
+
+sw_sin_par_iqr <- table_sin_par_iqr %>% 
+  sample_n(243)
+
+result_sin_par_iqr <- shapiro.test(sw_sin_par_iqr$sin_par_prop)
+print(result_sin_par_iqr)
+
+skewness_sin_par_iqr <- skewness(sw_sin_par_iqr$sin_par_prop)
+print(paste0('Skewness: ', skewness_sin_par_iqr))
+
+kurtosis_sin_par_iqr <- kurtosis(sw_sin_par_iqr$sin_par_prop)
+print(paste0('Kurtosis: ', kurtosis_sin_par_iqr))
+
+stats_sin_par_iqr <- table_sin_par_iqr %>% 
+  summarize(mean_sin_par_iqr=mean(sin_par_prop))
+
+table_sin_par_iqr %>% 
+  ggplot(aes(sin_par_prop)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_sin_par_iqr), 
+                 stats_sin_par_iqr,
+                 color='red',
+                 linewidth=1) -> sin_par_iqr
+ggplotly(sin_par_iqr)
+```
+
+Distribution of the renter/owner status variable. The distribution looks
+a bit problematic because it doesn't seem completely unimodal (skewness
+= 0.66, kurtosis = 2.59, W = 0.94, p-value = 4.7e-8). There is a
+moderate skew to the right but instead of more trimming which reduces
+the size of our dataset we will try a square root transformation.
+
+```{r}
+table_renter <- table_sin_par_iqr
+
+summary(table_renter$renter_prop)
+
+# sw_sin_par_iqr can be reused for the Shapriro_Wilk test.
+result_renter <- shapiro.test(sw_sin_par_iqr$renter_prop)
+print(result_renter)
+
+skewness_renter <- skewness(sw_sin_par_iqr$renter_prop)
+print(paste0('Skewness: ', skewness_renter))
+
+kurtosis_renter <- kurtosis(sw_sin_par_iqr$renter_prop)
+print(paste0('Kurtosis: ', kurtosis_renter))
+
+stats_renter <- table_renter %>% 
+  summarize(mean_renter=mean(renter_prop))
+
+table_renter %>% 
+  ggplot(aes(renter_prop)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_renter), 
+                 stats_renter,
+                 color='red',
+                 linewidth=1) -> renter1
+ggplotly(renter1)
+```
+
+Square root transformation on the renter/owner status variable. Skewness
+has been remedied but a group of outliers to the left might be
+responsible for the low p-value of 4.7e-8). Do we dare to trim it? Why
+not.
+
+```{r}
+table_renter_sqrt <- table_renter %>% 
+  mutate(renter_sqrt = sqrt(renter_prop))
+
+summary(table_renter_sqrt$renter_sqrt)
+
+sw_renter_sqrt <- table_renter_sqrt %>% 
+  sample_n(243)
+
+result_renter_sqrt <- shapiro.test(sw_renter_sqrt$renter_sqrt)
+print(result_renter)
+
+skewness_renter_sqrt <- skewness(sw_renter_sqrt$renter_sqrt)
+print(paste0('Skewness: ', skewness_renter_sqrt))
+
+kurtosis_renter_sqrt <- kurtosis(sw_renter_sqrt$renter_sqrt)
+print(paste0('Kurtosis: ', kurtosis_renter_sqrt))
+
+stats_renter_sqrt <- table_renter_sqrt %>% 
+  summarize(mean_renter_sqrt=mean(renter_sqrt))
+
+table_renter_sqrt %>% 
+  ggplot(aes(renter_sqrt)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_renter_sqrt), 
+                 stats_renter_sqrt,
+                 color='red',
+                 linewidth=1) -> renter2
+ggplotly(renter2)
+```
+
+Trimming the tails of the renter/owner status variable. Trimming the
+tails got rid of the target outliers but new ones emerged and the
+distribution was not improved so we will stick with just the square root
+transformation, in 'table_renter_sqrt'.
+
+```{r}
+quartiles_renter <- quantile(table_renter_sqrt$renter_sqrt, 
+                      probs = c(0.25, 0.75), 
+                      na.rm = FALSE)
+IQR_renter<- IQR(table_renter_sqrt$renter_sqrt)
+
+Lower_renter <- quartiles_renter[1] - 1.52*IQR_renter
+Upper_renter <- quartiles_renter[2] + 1.52*IQR_renter
+
+table_renter_iqr <- table_renter_sqrt %>% 
+  filter(renter_sqrt > Lower_renter & renter_sqrt < Upper_renter)
+
+summary(table_renter_iqr$renter_sqrt)
+
+sw_renter_iqr <- table_renter_iqr %>% 
+  sample_n(243)
+
+result_renter_sqrt <- shapiro.test(sw_renter_sqrt$renter_sqrt)
+print(result_renter)
+
+skewness_renter_sqrt <- skewness(sw_renter_sqrt$renter_sqrt)
+print(paste0('Skewness: ', skewness_renter_sqrt))
+
+kurtosis_renter_sqrt <- kurtosis(sw_renter_sqrt$renter_sqrt)
+print(paste0('Kurtosis: ', kurtosis_renter_sqrt))
+
+stats_renter_sqrt <- table_renter_sqrt %>% 
+  summarize(mean_renter_sqrt=mean(renter_sqrt))
+
+table_renter_iqr %>% 
+  ggplot(aes(renter_sqrt)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_renter_sqrt), 
+                 stats_renter_sqrt,
+                 color='red',
+                 linewidth=1) -> renter3
+ggplotly(renter3)
+```
+
+Distribution of the education variable. The distribution is fairly
+heavily skewed to the right and looks a bit bimodal. We will try a
+square root transformation.
+
+```{r}
+table_edu <- table_renter_sqrt
+
+summary(table_edu$no_edu_prop)
+
+#'sw_renter_sqrt' can be reused.
+result_edu <- shapiro.test(sw_renter_sqrt$no_edu_prop)
+print(result_edu)
+
+skewness_edu <- skewness(sw_renter_sqrt$no_edu_prop)
+print(paste0('Skewness: ', skewness_edu))
+
+kurtosis_edu <- kurtosis(sw_renter_sqrt$no_edu_prop)
+print(paste0('Kurtosis: ', kurtosis_edu))
+
+stats_edu <- table_edu %>% 
+  summarize(mean_edu=mean(no_edu_prop))
+
+table_edu %>% 
+  ggplot(aes(no_edu_prop)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_edu), 
+                 stats_edu,
+                 color='red',
+                 linewidth=1) -> edu1
+ggplotly(edu1)
+```
+
+Square root transformation on the education variable. The distribution
+is fairly symmetrical now and closer to being normal (skewness = -0.32,
+kurtosis = 3.58, W = 0.98, p-value = 9.0e-3).
+
+```{r}
+table_edu_sqrt <- table_edu %>% 
+  mutate(no_edu_sqrt = sqrt(no_edu_prop))
+
+summary(table_edu_sqrt$no_edu_sqrt)
+
+sw_edu_sqrt <- table_edu_sqrt %>% 
+  sample_n(243)
+
+result_edu_sqrt <- shapiro.test(sw_edu_sqrt$no_edu_sqrt)
+print(result_edu_sqrt)
+
+skewness_edu_sqrt <- skewness(sw_edu_sqrt$no_edu_sqrt)
+print(paste0('Skewness: ', skewness_edu_sqrt))
+
+kurtosis_edu_sqrt <- kurtosis(sw_edu_sqrt$no_edu_sqrt)
+print(paste0('Kurtosis: ', kurtosis_edu_sqrt))
+
+stats_edu_sqrt <- table_edu_sqrt %>% 
+  summarize(mean_edu_sqrt=mean(no_edu_sqrt))
+
+table_edu_sqrt %>% 
+  ggplot(aes(no_edu_sqrt)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_edu_sqrt), 
+                 stats_edu_sqrt,
+                 color='red',
+                 linewidth=1) -> edu2
+ggplotly(edu2)
+```
+
+Distribution of the immigration variable. The distribution looks pretty
+good though it is a bit platykurtic (skewness = 0.008, kurtosis = 2.09,
+W = 0.98, p-value = 1.9e-3). We will leave it as it.
+
+```{r}
+table_immig <- table_edu_sqrt
+
+summary(table_immig$immig_prop)
+
+#sw_edu_sqrt can be reused here.
+result_immig <- shapiro.test(sw_edu_sqrt$immig_prop)
+print(result_immig)
+
+skewness_immig <- skewness(sw_edu_sqrt$immig_prop)
+print(paste0('Skewness: ', skewness_immig))
+
+kurtosis_immig <- kurtosis(sw_edu_sqrt$immig_prop)
+print(paste0('Kurtosis: ', kurtosis_immig))
+
+stats_immig <- table_immig %>% 
+  summarize(mean_immig=mean(immig_prop))
+
+table_immig %>% 
+  ggplot(aes(immig_prop)) +
+  geom_histogram(bins = 100) +
+  geom_vline(aes(xintercept=mean_immig), 
+                 stats_immig,
+                 color='red',
+                 linewidth=1) -> immig1
+ggplotly(immig1)
+```
+
+Closing remarks on the transforming section. Trimming outliers from one
+variable obviously affects all variables because entire rows of data are
+being removed. I'm assuming that the effect is negligible since it
+should be a fairly haphazard removal of values from the other variables.
+However, is that the case for highly correlated variables? Playing with
+the bins can make a distribution look cleaner but is that a good thing?
+I'm transforming mainly on the results of the stat test but learning
+good binning skills would be useful because some of the distributions
+look even uglier even though the stats have improved.
+
+## Modelling, First with the untransformed dataset
+
+Create training and testing datasets.
+
+Scale the dataset.
+
+```{r}
+data_scaled <- table_hl_2 %>%
+  mutate(across(.cols = c(1:7), 
+                ~ as.vector(scale(.)), 
+                .names = "z_{.col}")) %>%
+  select(c(8:15))
+```
+
+```{r}
+intraining <- createDataPartition(table_hl_2$target_hl, p = 0.80, list = FALSE)
+
+training <- table_hl_2[intraining,]
+
+testdata <- table_hl_2[-intraining,]
+```
+
+Check to see if the training and testdata sets have equal numbers of
+'High' and 'Low' values in each set.
+
+```{r}
+# You only have to do this for one set because if it's equal in one it's equal in the other.
+tapply(testdata$target_hl, testdata$target_hl, length)
+```
+
+Specify the model tuning parameters and model evaluation metrics.
+
+```{r}
+control <- trainControl(method = 'cv', number = 10)
+metric <- 'Accuracy'
+```
+
+## Linear Discriminant Analysis
+
+Assumes data is normally distributed.
+
+Assumes classes has identical covariance matrices. (What is this?)
+
+But, performs well even if this assumption is violated.
+
+Possible issues:
+
+1.  May not effectively separate non-linearly separable classes. (How to
+    test for this?). This would result in poor model accuracy and the
+    easiest solution is to choose a non-linear model such as decision
+    trees, random forests, or support vector machines with non-linear
+    kernels. This is why we will test more than one type of model.
+
+2.  Small Sample Size problem. (What is this?)....Regularization to fix
+    it. This is when the number of samples (observations) is less than
+    the number of variables. We don't have this problem because our
+    dataset contains 1000 samples and only seven predictor variables and
+    one dependent variable.
+
+```{r}
+set.seed(123)
+
+fit.lda <- train(target_hl~.,
+                 data = training,
+                 method = 'lda',
+                 metric = metric,
+                 trControl = control)
+
+pred_lda <- predict(fit.lda, testdata)
+
+cm_lda <- confusionMatrix(pred_lda, as.factor(testdata$target_hl))
+
+cm_lda
+
+```
+
+Classification and Regression Tree
+
+We will use the 'rpart' method from caret package.
+
+Decision trees are easy to interpret because they use boolean logic and
+can be visualized with a diagram. It is easy to see which variables are
+most important. Discrete, continuous and categorical variables can be
+used and can tolerate missing values and outliers (kumar, 2019) .
+Insensitive to highly correlated data (Kumar, 2019), which is common in
+survey data like ours, and do not require normally distributed data or
+scaling of data.
+
+Disadvantages:
+
+Prone to overfitting if there is noise or random variations in the
+training data or can't generalize to new data. Small variations in the
+data can produce very different trees (Kumar, 2019). There are
+parameters that can be set to help mitigate the disadvantages but for us
+this would require a lot deeper understanding of data and how the
+parameters work would also require more setup.
+
+```{r}
+set.seed(123)
+
+fit.cart <- train(target_hl~.,
+                 data = training,
+                 method = 'rpart',
+                 metric = metric,
+                 trControl = control)
+
+pred_cart <- predict(fit.cart, testdata)
+
+cm_cart <- confusionMatrix(pred_cart, as.factor(testdata$target_hl))
+
+cm_cart
+```
+
+## Support Vector Machine
+
+```{r}
+set.seed(123)
+
+fit.svm <- train(target_hl~.,
+                 data = training,
+                 method = 'svmRadial',
+                 metric = metric,
+                 trControl = control)
+
+pred_svm <- predict(fit.svm, testdata)
+
+cm_svm <- confusionMatrix(pred_svm, as.factor(testdata$target_hl))
+
+cm_svm
+
+```
+
+Visualize the confusion matrix for SVM.
+
+```{r}
+cm_svm
+```
+
+## Models with the transformed dataset
+
+Remove another extraneous column left over from previous operations. The dataset for the transformed models has yet to be scaled and High/Low categories balanced. We do that now.
+
+```{r}
+table_immig_2 <- table_immig %>% 
+  subset(select = -c(renter_prop, no_edu_prop))
+
+tapply(table_immig_scaled$target_hl, table_immig_scaled$target_hl, length)
+```
+
+Balance the dataset for 'High' and 'Low' values.
+
+```{r}
+df_high_2 <- table_immig_2 %>% 
+  filter(target_hl == 'High') %>% 
+  sample_n(370)
+
+df_low_2 <- table_immig_2 %>% 
+  filter(target_hl == 'Low') %>% 
+  sample_n(370)
+
+# Join the tables by adding the rows together. Note to self: You can do this because the columns are exactly the same. If there were any columns not shared then thos columns would get NA values.
+table_immig_balanced <- bind_rows(df_high_2, df_low_2, .id = NULL)
+
+tapply(table_immig_balanced$target_hl, table_immig_balanced$target_hl, length)
+```
+
+Scale the transformed dataset.
+
+```{r}
+data_scaled_transformed <- table_immig_balanced %>%
+  mutate(across(.cols = c(1:4, 6:8), 
+                ~ as.vector(scale(.)), 
+                .names = "z_{.col}")) %>%
+  select(c(5, 9:15))
+```
+
+Create datasets for training and testing the models.
+
+```{r}
+intraining_2 <- createDataPartition(data_scaled_transformed$target_hl, p = 0.80, list = FALSE)
+
+training_2 <- data_scaled_transformed[intraining_2,]
+
+testdata_2 <- data_scaled_transformed[-intraining_2,]
+
+
+```
+
+Check to make sure the training and test datasets are balanced between
+'High' and 'Low' values.
+
+```{r}
+# You only have to do this for one set because if it's equal in one it's equal in the other.
+tapply(testdata_2$target_hl, testdata_2$target_hl, length)
+```
+
+## LDA with transformed data
+
+```{r}
+set.seed(555)
+
+fit.lda_2 <- train(target_hl~.,
+                 data = training_2,
+                 method = 'lda',
+                 metric = metric,
+                 trControl = control)
+
+pred_lda_2 <- predict(fit.lda_2, testdata_2)
+
+cm_lda_2 <- confusionMatrix(pred_lda_2, as.factor(testdata_2$target_hl))
+
+cm_lda_2
+```
+
+## CART with transformed dataset
+
+```{r}
+set.seed(555)
+
+fit.cart_2 <- train(target_hl~.,
+                 data = training_2,
+                 method = 'rpart',
+                 metric = metric,
+                 trControl = control)
+
+pred_cart_2 <- predict(fit.cart_2, testdata_2)
+
+cm_cart_2 <- confusionMatrix(pred_cart_2, as.factor(testdata_2$target_hl))
+
+cm_cart_2
+```
+
+## SVM with transformed dataset
+
+```{r}
+set.seed(555)
+
+fit.svm_2 <- train(target_hl~.,
+                 data = training_2,
+                 method = 'svmRadial',
+                 metric = metric,
+                 trControl = control)
+
+pred_svm_2 <- predict(fit.svm_2, testdata_2)
+
+cm_svm_2 <- confusionMatrix(pred_svm_2, as.factor(testdata_2$target_hl))
+
+cm_svm_2
+```
+
+## Principal Component Regression Didn't Work!
+
+The variables in our dataset have significant but weak to moderate
+correlation among them and possibly suffers from multicollinearity
+considering they all were probably collected with household economics in
+mind. This can cause large variances in least squares estimates that
+mask their true value. PCA attempts to reduce standard errors by
+intentionally introducing bias to the regression estimates.
+
+This code doesn't work but there's no more time to figure out why.
+
+```{r}
+set.seed(123)
+
+fit.pcr <- train(target_hl~.,
+                 data = training,
+                 method = 'pcr',
+                 metric = metric,
+                 trControl = control)
+
+pred_pcr <- predict(fit.pcr, testdata)
+
+cm_pcr <- confusionMatrix(pred_pcr, as.factor(testdata$target_hl))
+```
+
+## Which model is the most accurate?
+
+```{r}
+results <- resamples(list(lda=fit.lda_2, cart=fit.cart_2, svm=fit.svm))
+summary(results)
+
+results_df <- as.data.frame(results)
+
+results_tidy <- results_df %>% 
+  pivot_longer(names_to = "Model", values_to = "Accuracy", -Resample) %>% 
+  group_by(Model) %>% 
+  summarise(Mean_Accuracy = mean(Accuracy))
+
+mean_acc <- results_tidy %>% 
+  ggplot(aes(x=fct_reorder(Model, Mean_Accuracy), y=Mean_Accuracy))+
+  geom_bar(stat = "identity")+
+  coord_flip()+
+  xlab("Mean Accuracy")+
+  ylab("Model")+
+  theme(text = element_text(size = 20))
+
+mean_acc
+```
+
+## Which variable is most important?
+
+```{r}
+# determining variable importance
+
+importance1 <- varImp(fit.lda)
+importance2 <- varImp(fit.cart)
+importance4 <- varImp(fit.svm)
+
+imp1 <- importance1$importance 
+imp2 <- importance2$importance
+imp4 <- importance4$importance
+
+p1 <- imp1 %>% 
+  mutate(Predictor = rownames(imp1)) %>% 
+  pivot_longer(names_to = "target_hl", values_to = "Importance", -Predictor) %>%
+  ggplot(aes(x=Predictor, y=Importance))+
+  geom_segment(aes(x=Predictor, xend=Predictor, y=0, yend=Importance), color="skyblue") +
+  geom_point(color="blue", size=4, alpha=0.6) +
+  theme_light() +
+  coord_flip() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank())+
+  ylab("Linear Discriminant Analysis")+
+  xlab("")
+
+p2 <- imp2 %>% 
+  mutate(Predictor = rownames(imp2)) %>% 
+  pivot_longer(names_to = "target_hl", values_to = "Importance", -Predictor) %>%
+  ggplot(aes(x=Predictor, y=Importance))+
+  geom_segment(aes(x=Predictor, xend=Predictor, y=0, yend=Importance), color="skyblue") +
+  geom_point(color="blue", size=4, alpha=0.6) +
+  theme_light() +
+  coord_flip() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank())+
+  ylab("Classification & Regression Tree")+
+  xlab("")
+
+p3 <- imp4 %>% 
+  mutate(Predictor = rownames(imp4)) %>% 
+  pivot_longer(names_to = "target_hl", values_to = "Importance", -Predictor) %>%
+  ggplot(aes(x=Predictor, y=Importance))+
+  geom_segment(aes(x=Predictor, xend=Predictor, y=0, yend=Importance), color="skyblue") +
+  geom_point(color="blue", size=4, alpha=0.6) +
+  theme_light() +
+  coord_flip() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank())+
+  ylab("Support Vector Machine")+
+  xlab("")
+
+```
+
+Display lollipops.
+
+```{r}
+plot_importance <- ggarrange(p1, p2, p3, ncol = 1, heights = c(4, 4, 4, 4), width = 6) +
+  theme(text = element_text(size = 12)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  theme(plot.margin = margin(2, 2, 2, 2))
+
+# save the plot to a file
+ggsave("plot_importance.png", plot_importance, height = 10, width = 8)
+
+# open the saved image in a viewer
+png_file <- "plot_importance.png"
+browseURL(png_file)
+```
